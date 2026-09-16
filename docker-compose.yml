@@ -3,14 +3,26 @@
 # 日常启动（安全形态，验收/重置接口不挂载）：
 #   WEB_PORT=8080 docker compose up --build
 #
-# 一次性验收（默认配置即可直接完成，验收服务在 verify profile 中，run 会自动激活）：
-#   docker compose up -d --build db web
+# 一次性验收（默认配置即可直接完成，验收服务在 verify profile 中，run 会自动激活并拉起依赖）：
 #   docker compose run --rm verify
 #
 # 安全隔离：
 #   - backend：面向页面的公开后端，SAMPLE_ENABLE_TEST_RESET=false，/api/test/* 为 404；
 #   - backend-verify：仅 compose 内网可达、不发布端口、需 X-Test-Token，供 verify 使用；
 #   - 页面访客经 nginx 只能访问 backend，无法触达 backend-verify，故无法清空数据。
+#
+# 令牌单一事实来源：下面只插值一次，验收后端与 verify 客户端复用同一值，
+# 杜绝两个容器各自插值导致的令牌漂移（默认值仅用于本地验收）。
+x-verify-token: &verify-token "${TEST_RESET_TOKEN:-verify-local-token}"
+
+# 后端通用健康检查（镜像内 python 探测 /api/health）
+x-backend-healthcheck: &backend-healthcheck
+  test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=2).status==200 else 1)"]
+  interval: 3s
+  timeout: 3s
+  retries: 30
+  start_period: 5s
+
 services:
   db:
     image: postgres:17-alpine
@@ -36,6 +48,7 @@ services:
     depends_on:
       db:
         condition: service_healthy
+    healthcheck: *backend-healthcheck
 
   # 验收专用后端：仅内网可达（不发布宿主机端口），开启钩子并强制令牌
   backend-verify:
@@ -45,10 +58,11 @@ services:
       SAMPLE_DATABASE_URL: postgresql+psycopg://sample:sample@db:5432/sample_db
       SAMPLE_HANDOFF_TTL_SECONDS: "600"
       SAMPLE_ENABLE_TEST_RESET: "true"
-      SAMPLE_TEST_RESET_TOKEN: ${TEST_RESET_TOKEN:-verify-local-token}
+      SAMPLE_TEST_RESET_TOKEN: *verify-token
     depends_on:
       db:
         condition: service_healthy
+    healthcheck: *backend-healthcheck
 
   web:
     build: ./frontend
@@ -69,14 +83,16 @@ services:
       # 公开入口（nginx → 安全后端），用于断言页面对外不暴露重置接口
       PUBLIC_API_URL: http://web
       VERIFY_DATABASE_URL: postgresql://sample:sample@db:5432/sample_db
-      TEST_RESET_TOKEN: ${TEST_RESET_TOKEN:-verify-local-token}
+      # 与 backend-verify 复用同一插值结果（见顶部锚点）
+      TEST_RESET_TOKEN: *verify-token
     depends_on:
       db:
         condition: service_healthy
-      backend-verify:
-        condition: service_started
       web:
         condition: service_started
+      # 等验收后端真正就绪（健康检查通过）后再开始，避免启动竞态导致的 401/连接失败
+      backend-verify:
+        condition: service_healthy
     restart: "no"
 
 volumes:

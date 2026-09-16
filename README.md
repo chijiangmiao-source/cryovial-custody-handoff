@@ -62,12 +62,12 @@ WEB_PORT=9000 docker compose up --build
 - `verify`：跑完即退出的一次性服务，演练流量打内网 `backend-verify`，并额外断言**经 nginx 的公开入口**
   即使携带令牌也无法触达重置接口。
 
-无需任何额外文件，一条命令即可完成验收（`run` 会自动激活 `verify` profile 并拉起 db/web/两个后端）：
+无需任何额外文件，一条命令即可完成验收（`run` 会自动激活 `verify` profile 并拉起 db/web/两个后端；`--build` 保证首次运行也会构建镜像）：
 
 ```bash
-docker compose run --rm verify        # 真实制造重复扫码、确认丢响应、两次创建竞争、
-                                      # 同键异参、完成后非接收员扫码、到期边界等；退出码 0 即通过
-docker compose down                   # 验收后清理
+docker compose run --build --rm verify   # 真实制造重复扫码、确认丢响应、两次创建竞争、
+                                         # 同键异参、完成后非接收员扫码、到期边界等；退出码 0 即通过
+docker compose down                      # 验收后清理
 ```
 
 可通过 `TEST_RESET_TOKEN` 指定令牌（验收后端与 verify 两端必须一致，默认仅本地用的 `verify-local-token`）：

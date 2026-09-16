@@ -91,10 +91,14 @@ def reset(client: httpx.Client) -> None:
     headers = {"X-Test-Token": TEST_RESET_TOKEN} if TEST_RESET_TOKEN else {}
     r = client.post(f"{BACKEND}/api/test/reset", headers=headers, timeout=30)
     if r.status_code != 204:
-        raise RuntimeError(
-            f"重置失败（HTTP {r.status_code}）。后端必须以 SAMPLE_ENABLE_TEST_RESET=true 启动，"
-            "且 TEST_RESET_TOKEN 与后端 SAMPLE_TEST_RESET_TOKEN 一致。"
-        )
+        detail = r.text.strip()[:300]
+        if r.status_code == 401:
+            hint = "令牌被拒绝：请确认 verify 的 TEST_RESET_TOKEN 与 backend-verify 的 SAMPLE_TEST_RESET_TOKEN 取自同一来源（compose 锚点），且没有复用旧令牌启动的 backend-verify 容器（先 docker compose down 再 run）。"
+        elif r.status_code == 404:
+            hint = "验收钩子未挂载：BACKEND_URL 必须指向开启了 SAMPLE_ENABLE_TEST_RESET=true 的 backend-verify，而非公开 backend。"
+        else:
+            hint = "请确认后端以 SAMPLE_ENABLE_TEST_RESET=true 启动且令牌一致。"
+        raise RuntimeError(f"重置失败（HTTP {r.status_code}）。{hint} 响应：{detail}")
 
 
 def main() -> int:
