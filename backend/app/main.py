@@ -27,17 +27,22 @@ async def lifespan(_app: FastAPI):
     yield
 
 
-app = FastAPI(title="冷冻样本夜班交接服务", version="1.0.0", lifespan=lifespan)
-app.include_router(router)
-if get_settings().enable_test_reset:
-    # 仅验收/测试环境：重置数据与模拟到期，生产环境不挂载
-    from .test_routes import router as test_router
+def create_app() -> FastAPI:
+    app = FastAPI(title="冷冻样本夜班交接服务", version="1.0.0", lifespan=lifespan)
+    app.include_router(router)
+    if get_settings().enable_test_reset:
+        # 仅验收/测试环境且配置了令牌时挂载：重置数据与模拟到期
+        from .test_routes import router as test_router
 
-    app.include_router(test_router)
-app.add_exception_handler(AppError, app_error_handler)
-app.add_exception_handler(RequestValidationError, validation_exception_handler)
+        app.include_router(test_router)
+    app.add_exception_handler(AppError, app_error_handler)
+    app.add_exception_handler(RequestValidationError, validation_exception_handler)
+
+    @app.get("/")
+    def root() -> dict[str, str]:
+        return {"service": "frozen-sample-handoff", "docs": "/docs"}
+
+    return app
 
 
-@app.get("/")
-def root() -> dict[str, str]:
-    return {"service": "frozen-sample-handoff", "docs": "/docs"}
+app = create_app()

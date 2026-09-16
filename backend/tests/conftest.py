@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import os
 
-# 必须在导入应用前指定测试库；可用 SAMPLE_DATABASE_URL 覆盖（如 unix socket）
+# 必须在导入应用前指定测试库与验收钩子（带令牌）；可用 SAMPLE_DATABASE_URL 覆盖
 os.environ.setdefault(
     "SAMPLE_DATABASE_URL",
     "postgresql+psycopg://postgres@localhost:5432/sample_test",
 )
+os.environ["SAMPLE_ENABLE_TEST_RESET"] = "true"
+os.environ.setdefault("SAMPLE_TEST_RESET_TOKEN", "test-token")
 
 import pytest  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402

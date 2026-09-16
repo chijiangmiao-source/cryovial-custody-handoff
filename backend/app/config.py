@@ -13,6 +13,8 @@ class Settings(BaseSettings):
     code_length: int = 8
     # 仅验收/测试环境开启：注册重置与到期模拟钩子，生产必须保持 false
     enable_test_reset: bool = False
+    # 验收钩子令牌：开启钩子时必须配置，调用 /api/test/* 需带 X-Test-Token 头
+    test_reset_token: str = ""
 
 
 @lru_cache

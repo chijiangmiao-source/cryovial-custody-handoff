@@ -1,0 +1,29 @@
+# 验收专用覆盖文件：仅在本地演练/验收时叠加，切勿用于面向真实数据的环境。
+#
+#   docker compose -f docker-compose.yml -f docker-compose.verify.yml up -d --build db backend web
+#   docker compose -f docker-compose.yml -f docker-compose.verify.yml run --rm verify
+#
+# 作用：
+#   1. 为后端开启验收钩子（/api/test/*），并要求 X-Test-Token 令牌；
+#   2. 提供跑完即退出的 verify 服务，令牌通过 TEST_RESET_TOKEN 注入两端。
+services:
+  backend:
+    environment:
+      SAMPLE_ENABLE_TEST_RESET: "true"
+      SAMPLE_TEST_RESET_TOKEN: ${TEST_RESET_TOKEN:-verify-local-token}
+
+  verify:
+    build: ./verify
+    environment:
+      BACKEND_URL: http://backend:8000
+      WEB_URL: http://web
+      VERIFY_DATABASE_URL: postgresql://sample:sample@db:5432/sample_db
+      TEST_RESET_TOKEN: ${TEST_RESET_TOKEN:-verify-local-token}
+    depends_on:
+      db:
+        condition: service_healthy
+      backend:
+        condition: service_healthy
+      web:
+        condition: service_started
+    restart: "no"

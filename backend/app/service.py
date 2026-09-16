@@ -152,9 +152,8 @@ def accept_handoff(db: Session, code: str, staff_code: str) -> Handoff:
             fields={"/code": "交接码超过十分钟有效期"},
         )
 
-    if handoff.status == "completed":
-        return handoff
-
+    # 身份校验先于状态短路：交接完成后，非指定接收员再次扫码必须提示无权，
+    # 不能因为 completed 的幂等返回而显示“接受成功”
     if handoff.to_staff_id != _staff_id(db, staff_code):
         raise AppError(
             403,
@@ -162,6 +161,10 @@ def accept_handoff(db: Session, code: str, staff_code: str) -> Handoff:
             "只有指定的接收员可以扫码接受",
             fields={"/staff_code": "该人员不是本次交接的接收员"},
         )
+
+    if handoff.status == "completed":
+        # 指定接收员本人在完成后重扫：幂等返回当前完成状态（扫码器重放语义）
+        return handoff
 
     if handoff.status == "pending":
         handoff.status = "accepted"

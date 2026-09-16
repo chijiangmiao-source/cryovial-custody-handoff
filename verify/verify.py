@@ -20,7 +20,7 @@ import sys
 import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timezone
+from datetime import datetime
 
 import httpx
 import psycopg
@@ -28,6 +28,8 @@ import psycopg
 BACKEND = os.environ.get("BACKEND_URL", "http://backend:8000").rstrip("/")
 WEB = os.environ.get("WEB_URL", "http://web").rstrip("/")
 DATABASE_URL = os.environ.get("VERIFY_DATABASE_URL", "")
+# 验收钩子令牌：后端开启 SAMPLE_ENABLE_TEST_RESET 时必须提供，调用 /api/test/* 需带头
+TEST_RESET_TOKEN = os.environ.get("TEST_RESET_TOKEN", "")
 
 PASS = "\033[32m✓\033[0m"
 FAIL = "\033[31m✗\033[0m"
@@ -84,10 +86,12 @@ def wait_backend(client: httpx.Client) -> None:
 
 
 def reset(client: httpx.Client) -> None:
-    r = client.post(f"{BACKEND}/api/test/reset", timeout=30)
+    headers = {"X-Test-Token": TEST_RESET_TOKEN} if TEST_RESET_TOKEN else {}
+    r = client.post(f"{BACKEND}/api/test/reset", headers=headers, timeout=30)
     if r.status_code != 204:
         raise RuntimeError(
-            f"重置失败（HTTP {r.status_code}）。后端必须以 SAMPLE_ENABLE_TEST_RESET=true 启动。"
+            f"重置失败（HTTP {r.status_code}）。后端必须以 SAMPLE_ENABLE_TEST_RESET=true 启动，"
+            "且 TEST_RESET_TOKEN 与后端 SAMPLE_TEST_RESET_TOKEN 一致。"
         )
 
 
@@ -184,6 +188,19 @@ def main() -> int:
                      {"staff_code": "S001", "operation_key": key("stale")})
         check("旧交接再次确认返回 completed 而非再次流转",
               stale.status_code == 200 and stale.json()["handoff"]["status"] == "completed")
+
+        # 完成后非指定接收员（S003）再次扫码：必须 403，不能假成功
+        intruder = post(client, f"/api/handoffs/{code}/accept",
+                        {"staff_code": "S003", "operation_key": key("intruder")})
+        check("完成后非接收员扫码被拒 403 not_receiver",
+              intruder.status_code == 403 and intruder.json()["error"]["code"] == "not_receiver",
+              f"HTTP {intruder.status_code}")
+        # 指定接收员本人重扫：幂等 200 completed
+        receiver = post(client, f"/api/handoffs/{code}/accept",
+                        {"staff_code": "S002", "operation_key": key("receiver-rescan")})
+        check("指定接收员完成后重扫幂等返回 completed",
+              receiver.status_code == 200 and receiver.json()["handoff"]["status"] == "completed")
+
         tube = get(client, "/api/tubes/T-1001").json()["tube"]
         check("保管人仍为 S002", tube["custodian"]["code"] == "S002")
 
@@ -198,7 +215,11 @@ def main() -> int:
         check("有效期恰为 600 秒", int((expires - created).total_seconds()) == 600)
         check("刚创建时未到期", h0["expired"] is False and h0["seconds_remaining"] >= 599)
 
-        expired = client.post(f"{BACKEND}/api/test/handoffs/{code2}/expire", timeout=30)
+        expired = client.post(
+            f"{BACKEND}/api/test/handoffs/{code2}/expire",
+            headers={"X-Test-Token": TEST_RESET_TOKEN} if TEST_RESET_TOKEN else {},
+            timeout=30,
+        )
         check("到期模拟成功", expired.status_code == 204, f"HTTP {expired.status_code}")
 
         h = get(client, f"/api/handoffs/{code2}").json()["handoff"]
@@ -236,6 +257,25 @@ def main() -> int:
         check("422 且字段以 JSON Pointer 列出",
               val.status_code == 422 and
               set(val.json()["error"]["fields"]) == {"/tube_code", "/from_staff_code", "/operation_key"})
+
+        # ---------------------------------------------------------------
+        print(f"{INFO} 场景 8：验收钩子默认关闭且需令牌（防裸奔）")
+        # 当前运行栈以正确令牌开启了钩子：无令牌/错令牌必须被拒
+        no_token = client.post(f"{BACKEND}/api/test/reset", timeout=30)
+        check("无令牌调用重置被拒（401；默认关闭时为 404）",
+              no_token.status_code in (401, 404), f"HTTP {no_token.status_code}")
+        wrong_token = client.post(
+            f"{BACKEND}/api/test/reset", headers={"X-Test-Token": "wrong"}, timeout=30
+        )
+        check("错误令牌调用重置被拒（401；默认关闭时为 404）",
+              wrong_token.status_code in (401, 404), f"HTTP {wrong_token.status_code}")
+        # 安全检查不得改动数据：最后用正确令牌重置并复核管状态仍可被验收正常建立
+        guarded = client.post(
+            f"{BACKEND}/api/test/handoffs/{new_code}/expire",
+            headers={"X-Test-Token": TEST_RESET_TOKEN} if TEST_RESET_TOKEN else {},
+            timeout=30,
+        )
+        check("持正确令牌的钩子调用成功（204）", guarded.status_code == 204, f"HTTP {guarded.status_code}")
 
     # ---------------------------------------------------------------
     print(f"{INFO} 数据库最终一致性断言")

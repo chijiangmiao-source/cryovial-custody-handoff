@@ -1,9 +1,11 @@
 import { expect, test, type APIRequestContext, type Page } from "@playwright/test";
 
 const BASE = process.env.E2E_BASE_URL ?? "http://localhost:5173";
+const TEST_TOKEN = process.env.TEST_RESET_TOKEN ?? "test-token";
+const TEST_HEADERS = { "X-Test-Token": TEST_TOKEN };
 
 async function reset(api: APIRequestContext) {
-  const r = await api.post("/api/test/reset");
+  const r = await api.post("/api/test/reset", { headers: TEST_HEADERS });
   expect(r.status()).toBe(204);
 }
 
@@ -152,7 +154,7 @@ test("到期边界：过期只封闭交接、不改保管人，页面显示已�
   const code = await page.getByTestId("accept-code").inputValue();
 
   // 模拟创建后超过十分钟
-  const expired = await request.post(`/api/test/handoffs/${code}/expire`);
+  const expired = await request.post(`/api/test/handoffs/${code}/expire`, { headers: TEST_HEADERS });
   expect(expired.status()).toBe(204);
 
   // 接收员再扫码：已到期
@@ -201,4 +203,61 @@ test("字段错误按 JSON Pointer 汇总显示", async ({ request }) => {
   expect(r.status()).toBe(422);
   const body = await r.json();
   expect(Object.keys(body.error.fields).sort()).toEqual(["/from_staff_code", "/operation_key", "/tube_code"]);
+});
+
+test("跨设备继续：转出员关页后，接收员凭 ?code 链接在新页面扫码接受", async ({ page, browser, request }) => {
+  await reset(request);
+  const { body } = await apiCreate(request);
+  const code = body.handoff.code;
+
+  // 转出员页面关闭；接收员在另一台设备/新上下文直接打开分享链接
+  const ctx = await browser.newContext();
+  const receiverPage = await ctx.newPage();
+  await receiverPage.goto(`${BASE}/?code=${code}`);
+  await expect(receiverPage.getByTestId("accept-code")).toHaveValue(code);
+
+  await receiverPage.getByLabel("扫码员工号").selectOption("S002");
+  await receiverPage.getByTestId("accept-button").click();
+  await expect(receiverPage.getByTestId("handoff-status")).toHaveText("已接受");
+
+  // 手动输入交接码入口也能打开
+  await receiverPage.goto(BASE);
+  await receiverPage.getByTestId("open-handoff-input").fill(code);
+  await receiverPage.getByTestId("open-handoff-button").click();
+  await expect(receiverPage.getByTestId("accept-code")).toHaveValue(code);
+  await expect(receiverPage.getByTestId("handoff-status")).toHaveText("已接受");
+  await ctx.close();
+});
+
+test("完成后非指定接收员再次扫码：提示无权而非成功，保管人不变", async ({ page, request }) => {
+  await reset(request);
+  const { body } = await apiCreate(request);
+  const code = body.handoff.code;
+  const ra = await request.post(`/api/handoffs/${code}/accept`, {
+    data: { staff_code: "S002", operation_key: `s-${Math.random().toString(36).slice(2)}` },
+  });
+  expect(ra.status()).toBe(200);
+  const rc = await request.post(`/api/handoffs/${code}/confirm`, {
+    data: { staff_code: "S001", operation_key: `c-${Math.random().toString(36).slice(2)}` },
+  });
+  expect(rc.status()).toBe(200);
+
+  // S003（非指定接收员）在页面上再次扫码
+  await page.goto(`${BASE}/?code=${code}`);
+  await expect(page.getByTestId("handoff-status")).toHaveText("已完成");
+  await page.getByLabel("扫码员工号").selectOption("S003");
+  await page.getByTestId("accept-button").click();
+  await expect(page.getByTestId("notice")).toContainText("只有指定的接收员");
+  await expect(page.getByTestId("handoff-status")).toHaveText("已完成");
+  await expect(page.getByTestId("custodian")).toHaveText("S002");
+
+  const tube = await readCustodian(request);
+  expect(tube.custodian.code).toBe("S002");
+});
+
+test("默认无令牌时验收钩子不可用于清空数据", async ({ request }) => {
+  const r1 = await request.post("/api/test/reset");
+  expect([401, 404]).toContain(r1.status());
+  const r2 = await request.post("/api/test/reset", { headers: { "X-Test-Token": "guessing" } });
+  expect([401, 404]).toContain(r2.status());
 });
