@@ -191,6 +191,14 @@ curl -s "$B/tubes/T-1001/history"
 
 ## 正确性设计要点
 
+### 并发启动串行化（`backend/app/database.py`）
+
+公开 `backend` 与 `backend-verify` 连同一个库，`docker compose run verify` 时两者可能对全新库
+**同时冷启动**；若并发执行 `CREATE TABLE`，PostgreSQL 系统目录可能冲突
+（`duplicate key ... pg_type_typname_nsp_index`），失败进程退出后经 nginx 访问即 **502**。
+引导段（建表 + 种子 + 基线补齐）在固定会话级咨询锁 `pg_advisory_lock` 内执行：先到进程建库，
+后到进程等待其提交，再走幂等检查，二者都能正常起来——公开入口健康检查 200、验收接口仍为 404。
+
 ### 状态机与锁（`backend/app/service.py`）
 
 状态：`pending → accepted → completed`，异常分支 `→ expired`。

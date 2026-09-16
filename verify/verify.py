@@ -117,6 +117,16 @@ def main() -> int:
         r = client.get(WEB, timeout=10)
         check("前端页面可访问且返回 HTML", r.status_code == 200 and "<div id=\"root\"" in r.text)
 
+        # 0.1 公开入口（nginx → 安全后端）必须可用：健康检查 200，验收钩子未挂载故 404。
+        # 若后端在并发启动的 DDL 竞争中崩溃，这里会表现为 502 而非 404，及早失败并给出定位。
+        public_health = client.get(f"{PUBLIC_API}/api/health", timeout=30)
+        check("公开后端入口可用（/api/health 200）",
+              public_health.status_code == 200,
+              f"HTTP {public_health.status_code}；若为 502，通常是公开后端启动失败，请查看其日志")
+        public_reset_early = client.post(f"{PUBLIC_API}/api/test/reset", timeout=30)
+        check("公开后端未挂载验收接口（重置为 404，而非 502）",
+              public_reset_early.status_code == 404, f"HTTP {public_reset_early.status_code}")
+
         # ---------------------------------------------------------------
         print(f"{INFO} 场景 1：两次创建竞争")
         reset(client)
