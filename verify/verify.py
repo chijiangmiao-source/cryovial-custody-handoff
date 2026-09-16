@@ -9,7 +9,10 @@
   4. 同键异参冲突：409；
   5. 旧交接不能覆盖已完成归属；
   6. 到期只封闭未完成交接，不改变保管人；封闭后可重新发起并完成；
-  7. 直连数据库断言：每管活动交接数 ≤ 1，保管人唯一且与页面 API 一致。
+  7. 直连数据库断言：每管活动交接数 ≤ 1，保管人唯一且与页面 API 一致；
+  8. 旧数据升级补齐上线基线；连续两次合法交接的时间边界（保管人/序号/交接码/前后变更项）；
+  9. 失败交接不留保管事件；确认响应丢失重放不重复追加；注入断链/缺基线时历史接口拒绝，
+     当前管码查询结果仍可用；早于可追溯起点明确返回无历史证据。
 
 通过则退出码 0，任一断言失败退出码 1。
 """
@@ -18,6 +21,7 @@ from __future__ import annotations
 import os
 import sys
 import threading
+import urllib.parse
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
@@ -295,6 +299,201 @@ def main() -> int:
         )
         check("持正确令牌经验收后端调用成功（204）", guarded.status_code == 204, f"HTTP {guarded.status_code}")
 
+        # ---------------------------------------------------------------
+        print(f"{INFO} 场景 9：旧数据升级 → 基线 → 连续两次合法交接 → 时间边界投影")
+
+        # 9.1 旧数据升级：reset 后账本存在基线；直接清空账本（模拟升级前的旧版本库），
+        # 再调用仅验收环境挂载的升级钩子，等价于服务带着新账本启动时的 backfill
+        reset(client)
+        h = get(client, "/api/tubes/T-1001/history").json()["history"]
+        check("升级后冻存管自带 seq=0 基线",
+              h["evidence_available"] is True and h["event_seq"] == 0 and h["handoff_code"] is None)
+
+        with psycopg.connect(DATABASE_URL) as conn, conn.cursor() as cur:
+            cur.execute("TRUNCATE custody_events")
+            conn.commit()
+        missing = get(client, "/api/tubes/T-1001/history")
+        check("无账本时历史接口返回可识别错误 custody_baseline_missing",
+              missing.status_code == 409 and
+              missing.json()["error"]["code"] == "custody_baseline_missing",
+              f"HTTP {missing.status_code}")
+        # 当前管码查询结果不受影响（页面保留当前查询）
+        cur_tube = get(client, "/api/tubes/T-1001").json()["tube"]
+        check("缺基线时当前管码查询仍返回保管人", cur_tube["custodian"]["code"] == "S001")
+
+        # 让基线生效于一个明确晚于“升级前时刻”的时间：先把数据库时钟基线时刻记下
+        upgrade_resp = client.post(
+            f"{BACKEND}/api/test/backfill-baselines",
+            headers={"X-Test-Token": TEST_RESET_TOKEN} if TEST_RESET_TOKEN else {},
+            timeout=30,
+        )
+        check("升级钩子为旧数据补齐基线",
+              upgrade_resp.status_code == 200 and upgrade_resp.json()["backfilled"] == 2,
+              upgrade_resp.text[:200])
+        # 幂等：再次执行不重复补
+        upgrade_again = client.post(
+            f"{BACKEND}/api/test/backfill-baselines",
+            headers={"X-Test-Token": TEST_RESET_TOKEN} if TEST_RESET_TOKEN else {},
+            timeout=30,
+        )
+        check("升级基线补齐幂等（第二次补 0 条）",
+              upgrade_again.status_code == 200 and upgrade_again.json()["backfilled"] == 0)
+
+        before_upgrade = urllib.parse.quote("2000-01-01T00:00:00+00:00", safe="")
+        h0 = get(client, f"/api/tubes/T-1001/history?at={before_upgrade}").json()["history"]
+        check("早于可追溯起点直接说明无历史证据",
+              h0["evidence_available"] is False and h0["custodian"] is None and h0["event_seq"] is None)
+        check("无证据时不返回交接码/前后变更项",
+              h0["handoff_code"] is None and h0["previous_change"] is None and h0["next_change"] is None)
+
+        # 9.2 连续两次合法交接：S001 → S002 → S003
+        def complete(tube, frm, to):
+            r, _ = create(client, tube=tube, frm=frm, to=to)
+            assert r.status_code == 201, f"create {r.status_code} {r.text[:200]}"
+            c = r.json()["handoff"]["code"]
+            ra = post(client, f"/api/handoffs/{c}/accept",
+                      {"staff_code": to, "operation_key": key("h-a")})
+            assert ra.status_code == 200, f"accept {ra.status_code}"
+            rc = post(client, f"/api/handoffs/{c}/confirm",
+                      {"staff_code": frm, "operation_key": key("h-c")})
+            assert rc.status_code == 200, f"confirm {rc.status_code} {rc.text[:200]}"
+            effective_at = rc.json()["handoff"]["completed_at"]
+            return c, effective_at
+
+        code1, t1 = complete("T-1001", "S001", "S002")
+        code2, t2 = complete("T-1001", "S002", "S003")
+
+        def history_at(tube, at=None):
+            url = f"/api/tubes/{tube}/history"
+            if at is not None:
+                url += f"?at={at}"
+            return get(client, url).json()["history"]
+
+        from datetime import datetime as _dt, timedelta as _td
+
+        def iso(dt, delta_microseconds=0):
+            t = _dt.fromisoformat(dt) + _td(microseconds=delta_microseconds)
+            return urllib.parse.quote(t.isoformat(), safe="")
+
+        # 9.3 边界前后归属与序号准确（等于生效时刻已生效）
+        before1 = history_at("T-1001", iso(t1, -1))
+        check("首次变更前 1 微秒：归属 S001 / seq=0",
+              before1["custodian"]["code"] == "S001" and before1["event_seq"] == 0)
+        check("前一变更项为空、后一变更项指向交接码 1",
+              before1["previous_change"] is None
+              and before1["next_change"]["seq"] == 1
+              and before1["next_change"]["handoff_code"] == code1)
+
+        at1 = history_at("T-1001", iso(t1))
+        check("恰好生效时刻 1：归属 S002 / seq=1 / 交接码正确",
+              at1["custodian"]["code"] == "S002" and at1["event_seq"] == 1
+              and at1["handoff_code"] == code1,
+              str((at1["custodian"], at1["event_seq"], at1["handoff_code"])))
+        check("seq=1 前一变更项为基线、后一变更项指向交接码 2",
+              at1["previous_change"]["kind"] == "baseline"
+              and at1["next_change"]["seq"] == 2
+              and at1["next_change"]["handoff_code"] == code2)
+        check("时间轴含全部事件且仅指定时刻事件被标记",
+              [e["seq"] for e in at1["timeline"]] == [0, 1, 2]
+              and [e["seq"] for e in at1["timeline"] if e["active_at_point"]] == [1])
+        check("时间轴事件含人员变更方向与交接码",
+              at1["timeline"][2]["from_staff"]["code"] == "S002"
+              and at1["timeline"][2]["to_staff"]["code"] == "S003"
+              and at1["timeline"][2]["handoff_code"] == code2)
+
+        at2 = history_at("T-1001", iso(t2))
+        check("恰好生效时刻 2：归属 S003 / seq=2",
+              at2["custodian"]["code"] == "S003" and at2["event_seq"] == 2
+              and at2["handoff_code"] == code2
+              and at2["previous_change"]["custodian"]["code"] == "S002"
+              and at2["next_change"] is None)
+        check("缺省时刻（当前）投影账本尾部 S003",
+              history_at("T-1001")["custodian"]["code"] == "S003")
+
+        # 9.4 一次失败交接：接收员接受后模拟到期，确认必须失败且不留事件
+        r, _ = create(client, tube="T-1002", frm="S001", to="S002")
+        bad_code = r.json()["handoff"]["code"]
+        post(client, f"/api/handoffs/{bad_code}/accept",
+             {"staff_code": "S002", "operation_key": key("bad-a")})
+        client.post(f"{BACKEND}/api/test/handoffs/{bad_code}/expire",
+                    headers={"X-Test-Token": TEST_RESET_TOKEN} if TEST_RESET_TOKEN else {}, timeout=30)
+        bad_confirm = post(client, f"/api/handoffs/{bad_code}/confirm",
+                           {"staff_code": "S001", "operation_key": key("bad-c")})
+        check("到期交接确认失败（410）", bad_confirm.status_code == 410, f"HTTP {bad_confirm.status_code}")
+        h_bad = history_at("T-1002")
+        check("失败交接不留保管事件（账本仍只有基线）",
+              [e["seq"] for e in h_bad["timeline"]] == [0]
+              and h_bad["custodian"]["code"] == "S001")
+
+        # 9.5 响应丢失重放不重复追加：对 code2 的确认结果用同键再取一次
+        replay = post(client, f"/api/handoffs/{code2}/confirm",
+                      {"staff_code": "S002", "operation_key": key("replay-check")})
+        # completed 后用“新键”只是幂等返回，不会产生新事件；这里直接核对账本行数
+        h_after = history_at("T-1001")
+        check("幂等返回不重复追加事件（T-1001 仍为 seq 0/1/2）",
+              replay.status_code == 200
+              and [e["seq"] for e in h_after["timeline"]] == [0, 1, 2])
+
+        # 真正的“响应丢失重放”：新建一条交接，并发双发同一确认键，只允许追加一条事件
+        r, _ = create(client, tube="T-1002", frm="S001", to="S003")
+        c3 = r.json()["handoff"]["code"]
+        post(client, f"/api/handoffs/{c3}/accept",
+             {"staff_code": "S003", "operation_key": key("c3-a")})
+        ckey = key("c3-c")
+        barrier = threading.Barrier(2)
+
+        def race_c3_confirm():
+            barrier.wait()
+            with httpx.Client() as c:
+                return post(c, f"/api/handoffs/{c3}/confirm",
+                            {"staff_code": "S001", "operation_key": ckey})
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            x1, x2 = [f.result() for f in [pool.submit(race_c3_confirm), pool.submit(race_c3_confirm)]]
+        check("双发确认均 200 且仅一次首执行",
+              x1.status_code == x2.status_code == 200
+              and sorted(h.headers.get("x-idempotent-replay") == "true" for h in (x1, x2)) == [False, True])
+        h_c3 = history_at("T-1002")
+        check("响应丢失重放只追加一条转移事件（基线 + seq=1）",
+              [e["seq"] for e in h_c3["timeline"]] == [0, 1]
+              and h_c3["custodian"]["code"] == "S003"
+              and h_c3["handoff_code"] == c3)
+
+        # 9.6 注入断链：删掉 seq=1 后历史接口必须拒绝，且当前查询仍保留
+        with psycopg.connect(DATABASE_URL) as conn, conn.cursor() as cur:
+            cur.execute("""
+                DELETE FROM custody_events
+                WHERE tube_id = (SELECT id FROM tubes WHERE code = 'T-1001') AND seq = 1
+            """)
+            conn.commit()
+        broken = get(client, "/api/tubes/T-1001/history")
+        check("注入断链（缺 seq=1）历史接口拒绝 custody_chain_broken",
+              broken.status_code == 409 and broken.json()["error"]["code"] == "custody_chain_broken",
+              f"HTTP {broken.status_code} {broken.text[:120]}")
+        still = get(client, "/api/tubes/T-1001")
+        check("断链时页面当前查询结果仍可用（S003）",
+              still.status_code == 200 and still.json()["tube"]["custodian"]["code"] == "S003")
+        # 指定时刻投影同样拒绝，绝不给出误导结果
+        broken_at = get(client, f"/api/tubes/T-1001/history?at={iso(t1)}")
+        check("断链后任意时刻投影都拒绝",
+              broken_at.status_code == 409
+              and broken_at.json()["error"]["code"] == "custody_chain_broken")
+        # 非法时刻参数：422 且字段指针为 /at
+        bad_at = get(client, "/api/tubes/T-1001/history?at=not-a-time")
+        check("非法历史时刻 422 且字段指向 /at",
+              bad_at.status_code == 422 and "/at" in bad_at.json()["error"].get("fields", {}))
+
+        # 为结尾的“数据库最终一致性断言”重建一个干净的规范状态：
+        # T-1001 完成一次 S001→S002 交接，T-1002 保持基线 S001（断链注入随之清除）
+        reset(client)
+        r, _ = create(client, tube="T-1001", frm="S001", to="S002")
+        canonical_code = r.json()["handoff"]["code"]
+        post(client, f"/api/handoffs/{canonical_code}/accept",
+             {"staff_code": "S002", "operation_key": key("canon-a")})
+        post(client, f"/api/handoffs/{canonical_code}/confirm",
+             {"staff_code": "S001", "operation_key": key("canon-c")})
+
+
     # ---------------------------------------------------------------
     print(f"{INFO} 数据库最终一致性断言")
     if DATABASE_URL:
@@ -319,6 +518,45 @@ def main() -> int:
 
                 cur.execute("SELECT status, count(*) FROM handoffs GROUP BY status ORDER BY status")
                 print(f"    {INFO} handoffs 状态分布：{dict(cur.fetchall())}")
+
+                # 保管账本不变量：每管 seq 从 0 连续、首条为基线、尾部保管人与当前保管人一致
+                cur.execute("""
+                    SELECT t.code, ce.seq, ce.kind, count(*) OVER (PARTITION BY ce.tube_id)
+                    FROM tubes t JOIN custody_events ce ON ce.tube_id = t.id
+                    ORDER BY t.code, ce.seq
+                """)
+                rows = cur.fetchall()
+                ledger: dict[str, list] = {}
+                for tube_code, seq, kind, _ in rows:
+                    ledger.setdefault(tube_code, []).append((seq, kind))
+                ledger_ok = True
+                for tube_code, chain in ledger.items():
+                    seqs = [s for s, _ in chain]
+                    if seqs != list(range(len(seqs))) or chain[0] != (0, "baseline"):
+                        ledger_ok = False
+                    if any(k != "transfer" for _, k in chain[1:]):
+                        ledger_ok = False
+                check("保管账本：每管序号从 0 连续且首条为基线、其后均为 transfer",
+                      ledger_ok and set(ledger) == {"T-1001", "T-1002"}, str(ledger))
+
+                cur.execute("""
+                    SELECT t.code FROM tubes t
+                    JOIN custody_events ce ON ce.id = (
+                        SELECT id FROM custody_events WHERE tube_id = t.id ORDER BY seq DESC LIMIT 1
+                    )
+                    WHERE ce.custodian_id <> t.custodian_id
+                """)
+                mismatches = cur.fetchall()
+                check("账本尾部保管人与冻存管当前保管人全部一致", mismatches == [], str(mismatches))
+
+                cur.execute("""
+                    SELECT count(*) FROM custody_events ce
+                    JOIN handoffs h ON h.id = ce.handoff_id
+                    WHERE ce.kind = 'transfer'
+                      AND (ce.from_staff_id <> h.from_staff_id OR ce.to_staff_id <> h.to_staff_id
+                           OR ce.handoff_code <> h.code)
+                """)
+                check("每条转移事件与对应交接的双方及交接码一致", cur.fetchone()[0] == 0)
     else:
         print("    （未提供 VERIFY_DATABASE_URL，跳过直连库断言）")
 

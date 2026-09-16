@@ -8,7 +8,8 @@
 - **接收员扫码接受后，仍为当前保管人的转出员才能最终确认**；旧交接不能覆盖已变更的归属；交接**完成后非指定接收员再次扫码会被拒为无权**（指定接收员本人重扫幂等返回完成状态）；
 - **原子写入**：新保管人与 `completed` 状态在同一事务中提交，提交前对外不可见；
 - **十分钟到期**：以**数据库时钟**（`statement_timestamp()`）为唯一时间源，创建 600 秒后到期，**截止时刻（等于到期时间）仍有效**，只封闭未完成交接，**不改变保管人**；
-- **字段错误按 JSON Pointer 汇总**（如 `/tube_code`、`/operation_key`）。
+- **任意时刻可追溯的保管账本**：每管一条不可变事件链，`seq=0` 为仅代表上线时现状的基线，此后每次确认交接都在**原事务内**追加带交接码的保管变更；按数据库生效时间投影即可回答“某管在指定时刻由谁保管”，早于基线的时刻直接说明**无历史证据**，断链/缺基线时历史接口返回可识别错误而非误导性结果；
+- **字段错误按 JSON Pointer 汇总**（如 `/tube_code`、`/operation_key`、`/at`）。
 
 ## 技术栈
 
@@ -17,13 +18,14 @@ Python 3.13 · FastAPI · SQLAlchemy 2 · PostgreSQL 17 · TypeScript · React 1
 ## 目录结构
 
 ```
-backend/          FastAPI 服务（持久化状态机、事务锁、幂等命令）
+backend/          FastAPI 服务（持久化状态机、事务锁、幂等命令、不可变保管账本）
   app/main.py       应用入口与演示数据
-  app/models.py     Staff / Tube / Handoff / CommandRecord 模型与部分唯一索引
+  app/models.py     Staff / Tube / Handoff / CustodyEvent / CommandRecord 模型与部分唯一索引
   app/service.py    状态机：创建 / 接受 / 确认 / 到期封闭（行锁、DB 时间）
+  app/ledger.py     保管账本：上线基线、确认事务内追加变更、断链校验、任意时刻投影
   app/idempotency.py 操作键：首次结果持久化、重放、同键异参冲突
   app/test_routes.py 验收钩子（仅令牌模式挂载，默认关闭）
-  tests/            pytest（含真实多线程并发与到期边界）
+  tests/            pytest（含真实多线程并发、到期边界与保管账本时间边界）
 frontend/         React + TS 页面（操作键持久化、断网重试、状态展示）
   src/keystore.ts     操作键 localStorage 持久化
   src/api.ts          命令重试（响应丢失不换键）
@@ -66,7 +68,9 @@ WEB_PORT=9000 docker compose up --build
 
 ```bash
 docker compose run --build --rm verify   # 真实制造重复扫码、确认丢响应、两次创建竞争、
-                                         # 同键异参、完成后非接收员扫码、到期边界等；退出码 0 即通过
+                                         # 同键异参、完成后非接收员扫码、到期边界、
+                                         # 旧数据升级/两次合法交接的时间边界/失败不留事件/注入断链等；
+                                         # 退出码 0 即通过
 docker compose down                      # 验收后清理
 ```
 
@@ -79,7 +83,7 @@ TEST_RESET_TOKEN=$(openssl rand -hex 16) docker compose run --rm verify
 > 安全模型：页面访客 → nginx → 公开 `backend`（钩子未挂载，404）；`backend-verify` 不暴露端口、
 > 仅内网 + 令牌可达。**面向真实数据的环境请保持默认 `up`，不要运行 verify profile，也不要发布 backend-verify 端口。**
 >
-> 验收钩子 `/api/test/reset`、`/api/test/handoffs/{code}/expire` 仅在
+> 验收钩子 `/api/test/reset`、`/api/test/handoffs/{code}/expire`、`/api/test/backfill-baselines` 仅在
 > `SAMPLE_ENABLE_TEST_RESET=true` 且配置了 `SAMPLE_TEST_RESET_TOKEN` 时挂载；
 > 未开启时返回 404（路由不存在），开启但令牌缺失/错误时返回 401。
 
@@ -170,6 +174,21 @@ curl -s -X POST $B/handoffs/<CODE>/accept -H 'Content-Type: application/json' \
 页面上：断网或响应丢失时，操作会进入“待处理操作”列表并保留操作键，网络恢复后点“重试”即可；
 结果区会显示 **已接受 / 已完成 / 已到期 / 冲突**。
 
+### 历史时间点查询（夜班复核）
+
+管码查询区在“当前保管人”之下提供**历史时间点查询**：留空时刻按数据库当前时刻投影，
+选择时刻后返回该时刻的保管人、账本序号与对应交接码，以及前一/后一变更项，并用时间轴展示
+上线基线之后的全部保管变更（该时刻生效的一条高亮）。查询时刻早于上线基线时，页面明确提示
+“没有任何历史证据”，不猜测任何保管人；账本缺失基线或断链时显示 `custody_baseline_missing` /
+`custody_chain_broken`，**当前保管人查询结果始终保留**。
+
+```bash
+# 指定时刻（ISO 8601，必须带时区；截止时刻 == 生效时刻即已生效）
+curl -s "$B/tubes/T-1001/history?at=2026-09-16T22:30:00%2B08:00"
+# 缺省时刻 = 数据库当前时刻
+curl -s "$B/tubes/T-1001/history"
+```
+
 ## 正确性设计要点
 
 ### 状态机与锁（`backend/app/service.py`）
@@ -185,6 +204,23 @@ curl -s -X POST $B/handoffs/<CODE>/accept -H 'Content-Type: application/json' \
   403 `not_receiver`；只有指定接收员本人重扫才幂等返回当前完成状态，避免“完成后谁扫都成功”；
 - 到期判定为严格不等号 `now > expires_at`，因此**等于**截止时刻仍有效；仅把未完成状态置为
   `expired`，绝不更新保管人。所有 `now` 都取自 `statement_timestamp()`。
+
+### 不可变保管账本（`backend/app/ledger.py`）
+
+- `custody_events` 每管一条链：数据库唯一约束 `(tube_id, seq)` 保证序号单调，`seq=0` 必须是
+  `baseline`（无人员、无交接码），之后只能是 `transfer`；
+- **基线只代表上线（或旧数据升级）那一刻的现状**：服务启动时为尚无账本的冻存管幂等补齐基线，
+  基线生效时刻即“可追溯起点”，更早的时刻返回 `evidence_available=false`、不给出任何保管人；
+- 确认交接时在**原事务内**执行 `append_transfer`：锁账本尾部后校验
+  “尾部保管人 == 冻存管当前保管人 == 本次转出员”，满足才追加
+  `seq+1 / 转出员→转入人 / 交接码 / statement_timestamp()`，并与 `tubes.custodian_id`、
+  `handoffs.status='completed'` 一起原子提交；任何校验失败整体回滚——**失败交接不留事件**；
+- 响应丢失后用同一操作键重放只读取首次结果，业务不会再执行，因此**不会重复追加**事件；
+- 历史接口为纯只读（不在读路径上封闭到期交接）：读出整链后校验首条基线、序号连续、
+  每条转移都从前一保管人接续且交接码齐全、尾部与当前保管人一致；
+  缺基线返回 409 `custody_baseline_missing`，断链/尾部不一致返回 409 `custody_chain_broken`，
+  拒绝投影任何可能误导调查的结果；
+- 任意时刻归属 = `effective_at <= 查询时刻` 的最后一条事件（等于生效时刻即已生效）。
 
 ### 幂等命令（`backend/app/idempotency.py`）
 
@@ -232,7 +268,7 @@ npx playwright install chromium
 npx playwright test
 ```
 
-> 验收钩子 `/api/test/reset`、`/api/test/handoffs/{code}/expire` 仅在
+> 验收钩子 `/api/test/reset`、`/api/test/handoffs/{code}/expire`、`/api/test/backfill-baselines` 仅在
 > `SAMPLE_ENABLE_TEST_RESET=true` 且 `SAMPLE_TEST_RESET_TOKEN` 非空时挂载；
 > 未开启返回 404，开启但令牌缺失/错误返回 401。**生产环境必须保持默认关闭。**
 
@@ -245,6 +281,7 @@ npx playwright test
 | POST | `/api/handoffs/{code}/confirm` | 转出员最终确认（工号、操作键） |
 | GET | `/api/handoffs/{code}` | 查询交接（读路径顺带封闭到期交接） |
 | GET | `/api/tubes/{code}` | 查询冻存管当前保管人与活动交接 |
+| GET | `/api/tubes/{code}/history` | 只读：保管账本时间轴 + 指定时刻（`?at=` ISO 8601）投影 |
 | GET | `/api/staff`、`/api/health` | 名册 / 健康检查 |
 
 错误响应统一为：
@@ -255,4 +292,4 @@ npx playwright test
 
 业务错误码：`validation_error`、`active_handoff_exists`、`not_custodian`、`same_party`、
 `not_receiver`、`not_owner`、`not_accepted`、`custodian_changed`、`handoff_expired`、
-`idempotency_conflict` 等。
+`idempotency_conflict`、`custody_baseline_missing`、`custody_chain_broken` 等。

@@ -261,3 +261,74 @@ test("默认无令牌时验收钩子不可用于清空数据", async ({ request 
   const r2 = await request.post("/api/test/reset", { headers: { "X-Test-Token": "guessing" } });
   expect([401, 404]).toContain(r2.status());
 });
+
+function datetimeLocalValue(d: Date): string {
+  const p = (n: number) => String(n).padStart(2, "0");
+  return (
+    `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}` +
+    `T${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`
+  );
+}
+
+test("历史时间点查询：时间轴投影边界归属，早于起点提示无证据且保留当前结果", async ({ page, request }) => {
+  // Playwright 的 fill 对 datetime-local 只接受分钟精度；秒级时刻通过原生 value setter 注入
+  async function fillHistoryTime(value: string) {
+    await page.getByTestId("history-time-input").evaluate((el, v) => {
+      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!;
+      setter.call(el, v);
+      el.dispatchEvent(new Event("input", { bubbles: true }));
+    }, value);
+  }
+
+  await reset(request);
+  const { body } = await apiCreate(request, { tube: "T-1001", from: "S001", to: "S002" });
+  const code = body.handoff.code;
+  await request.post(`/api/handoffs/${code}/accept`, {
+    data: { staff_code: "S002", operation_key: `h-a-${Math.random().toString(36).slice(2)}` },
+  });
+  // 让上线基线与首次保管变更之间留出秒级可查窗口（datetime-local 精度为秒）
+  await new Promise((r) => setTimeout(r, 2500));
+  const confirmed = await request.post(`/api/handoffs/${code}/confirm`, {
+    data: { staff_code: "S001", operation_key: `h-c-${Math.random().toString(36).slice(2)}` },
+  });
+  expect(confirmed.status()).toBe(200);
+  const completedAt = new Date((await confirmed.json()).handoff.completed_at);
+
+  await page.goto(BASE);
+  await page.getByTestId("lookup-input").fill("T-1001");
+  await page.getByTestId("lookup-button").click();
+  await expect(page.getByTestId("lookup-custodian")).toContainText("S002");
+
+  // 完成时刻约 2.5 秒后于上线基线：完成前 1.5 秒落在“基线之后、转移之前”的窗口内
+  // （datetime-local 精度为秒），保管人应为 S001（基线 seq=0），时间轴含 seq=1 的交接码
+  await fillHistoryTime(datetimeLocalValue(new Date(completedAt.getTime() - 1500)));
+  await page.getByTestId("history-button").click();
+  await expect(page.getByTestId("history-custodian")).toContainText("S001");
+  await expect(page.getByTestId("history-seq")).toHaveText("0");
+  await expect(page.getByTestId("history-event-1")).toContainText(code);
+  await expect(page.getByTestId("history-event-0")).toHaveAttribute("data-active", "true");
+  await expect(page.getByTestId("history-event-1")).toHaveAttribute("data-active", "false");
+  // 当前查询结果始终保留
+  await expect(page.getByTestId("lookup-custodian")).toContainText("S002");
+
+  // 完成时刻 2 秒后：转移已生效 → S002 / seq=1
+  await fillHistoryTime(datetimeLocalValue(new Date(completedAt.getTime() + 2000)));
+  await page.getByTestId("history-button").click();
+  await expect(page.getByTestId("history-custodian")).toContainText("S002");
+  await expect(page.getByTestId("history-seq")).toHaveText("1");
+  await expect(page.getByTestId("history-event-1")).toHaveAttribute("data-active", "true");
+
+  // 清空时刻：投影当前 → S002 / seq=1
+  await page.getByTestId("history-clear-time").click();
+  await page.getByTestId("history-button").click();
+  await expect(page.getByTestId("history-custodian")).toContainText("S002");
+  await expect(page.getByTestId("history-seq")).toHaveText("1");
+  await expect(page.getByTestId("history-event-1")).toHaveAttribute("data-active", "true");
+
+  // 早于上线基线：明确无历史证据，不给出保管人
+  await fillHistoryTime("2000-01-01T00:00:00");
+  await page.getByTestId("history-button").click();
+  await expect(page.getByTestId("history-no-evidence")).toContainText("没有任何历史证据");
+  expect(await page.getByTestId("history-custodian").count()).toBe(0);
+  await expect(page.getByTestId("lookup-custodian")).toContainText("S002");
+});

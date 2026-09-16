@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 
 from .config import Settings, get_settings
 from .errors import AppError
+from .ledger import append_transfer, ensure_tube_baseline
 from .models import ACTIVE_STATUSES, Handoff, Staff, Tube
 
 # 去除易混字符 I/O/0/1
@@ -213,10 +214,12 @@ def confirm_handoff(db: Session, code: str, staff_code: str) -> Handoff:
             fields={"/code": "该交接已失效"},
         )
 
-    # 同一事务内原子写入新保管人与完成状态，提交前二者对外部均不可见
+    # 同一事务内：先校验账本尾部 == 当前保管人 == 转出员，再原子写入
+    # 不可变保管变更、新保管人与完成状态，任何一步失败整体回滚（不留下事件）
+    event = append_transfer(db, tube=tube, handoff=handoff, now=now)
     tube.custodian_id = handoff.to_staff_id
     handoff.status = "completed"
-    handoff.completed_at = now
+    handoff.completed_at = event.effective_at
     db.flush()
     return handoff
 

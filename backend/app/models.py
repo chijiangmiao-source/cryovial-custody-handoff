@@ -104,6 +104,61 @@ class Handoff(Base):
     to_staff: Mapped[Staff] = relationship(foreign_keys=[to_staff_id], lazy="joined")
 
 
+class CustodyEvent(Base):
+    """
+    不可变保管账本：每管一条单调序号链。
+    - seq=0 为上线基线，仅代表系统上线（或旧数据升级）时的现状，没有交接码、没有转出/接收人；
+    - 其后每条 transfer 都在“确认交接”的原事务内追加，生效时刻取自数据库时钟，
+      交接完成即保管变更，提交前对外不可见。
+    账本只增不改：任何更正都应通过新事件体现，而不是修改历史行。
+    """
+
+    __tablename__ = "custody_events"
+    __table_args__ = (
+        # 每管序号严格唯一单调，作为投影任意时刻归属的依据
+        UniqueConstraint("tube_id", "seq", name="ux_custody_events_tube_seq"),
+        CheckConstraint("seq >= 0", name="ck_custody_events_seq"),
+        CheckConstraint("kind IN ('baseline', 'transfer')", name="ck_custody_events_kind"),
+        CheckConstraint(
+            "(kind = 'baseline' AND from_staff_id IS NULL AND to_staff_id IS NULL "
+            "AND handoff_id IS NULL AND handoff_code IS NULL) "
+            "OR (kind = 'transfer' AND from_staff_id IS NOT NULL AND to_staff_id IS NOT NULL "
+            "AND handoff_id IS NOT NULL AND handoff_code IS NOT NULL)",
+            name="ck_custody_events_shape",
+        ),
+        CheckConstraint("custodian_id IS NOT NULL", name="ck_custody_events_custodian"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    tube_id: Mapped[int] = mapped_column(
+        ForeignKey("tubes.id", ondelete="CASCADE"), nullable=False
+    )
+    seq: Mapped[int] = mapped_column(Integer, nullable=False)
+    kind: Mapped[str] = mapped_column(String(16), nullable=False)
+    # 该事件生效后的保管人：基线即上线时保管人，转移即本次接收人
+    custodian_id: Mapped[int] = mapped_column(
+        ForeignKey("staff.id", ondelete="RESTRICT"), nullable=False
+    )
+    from_staff_id: Mapped[int | None] = mapped_column(
+        ForeignKey("staff.id", ondelete="RESTRICT"), nullable=True
+    )
+    to_staff_id: Mapped[int | None] = mapped_column(
+        ForeignKey("staff.id", ondelete="RESTRICT"), nullable=True
+    )
+    handoff_id: Mapped[int | None] = mapped_column(
+        ForeignKey("handoffs.id", ondelete="CASCADE"), nullable=True
+    )
+    # 快照交接码：账本自包含，即使交接行被清理也能读出“对应交接码”
+    handoff_code: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    effective_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("statement_timestamp()"), nullable=False
+    )
+
+    custodian: Mapped[Staff] = relationship(foreign_keys=[custodian_id], lazy="joined")
+    from_staff: Mapped[Staff | None] = relationship(foreign_keys=[from_staff_id], lazy="joined")
+    to_staff: Mapped[Staff | None] = relationship(foreign_keys=[to_staff_id], lazy="joined")
+
+
 class CommandRecord(Base):
     """每个操作键的首次结果，保证断网/扫码器重发时重放一致、同键异参冲突。"""
 

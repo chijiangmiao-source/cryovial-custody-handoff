@@ -9,6 +9,7 @@ from .api import router, validation_exception_handler
 from .config import get_settings
 from .database import SessionLocal, create_all
 from .errors import AppError, app_error_handler
+from .ledger import backfill_baselines
 from .seed_data import seed_data_if_needed
 
 
@@ -16,6 +17,9 @@ def seed() -> None:
     db = SessionLocal()
     try:
         seed_data_if_needed(db)
+        # 旧数据升级：为历史遗留、尚无账本的冻存管补齐“仅代表升级时现状”的基线
+        backfill_baselines(db)
+        db.commit()
     finally:
         db.close()
 

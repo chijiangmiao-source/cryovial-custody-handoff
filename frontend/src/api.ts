@@ -1,4 +1,4 @@
-import type { ApiErrorBody, FieldErrors, Handoff, Staff, TubeInfo } from "./types";
+import type { ApiErrorBody, FieldErrors, Handoff, Staff, TubeHistory, TubeInfo } from "./types";
 
 export class ApiRequestError extends Error {
   constructor(
@@ -109,6 +109,12 @@ export const api = {
     apiGet<{ handoff: Handoff }>(`/api/handoffs/${encodeURIComponent(code)}`).then((r) => r.handoff),
   getTube: (code: string) =>
     apiGet<{ tube: TubeInfo }>(`/api/tubes/${encodeURIComponent(code)}`).then((r) => r.tube),
+  getTubeHistory: (code: string, at: Date | null) =>
+    apiGet<{ history: TubeHistory }>(
+      `/api/tubes/${encodeURIComponent(code)}/history${
+        at ? `?at=${encodeURIComponent(at.toISOString())}` : ""
+      }`,
+    ).then((r) => r.history),
   createHandoff: (payload: {
     tube_code: string;
     from_staff_code: string;

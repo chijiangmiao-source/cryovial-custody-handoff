@@ -30,7 +30,12 @@ def reset(
     x_test_token: str | None = Header(default=None, alias="X-Test-Token"),
 ):
     _ensure_enabled(x_test_token)
-    db.execute(text("TRUNCATE command_records, handoffs, tubes, staff RESTART IDENTITY CASCADE"))
+    db.execute(
+        text(
+            "TRUNCATE command_records, custody_events, handoffs, tubes, staff "
+            "RESTART IDENTITY CASCADE"
+        )
+    )
     db.commit()
     seed_data_if_needed(db)
 
@@ -54,3 +59,17 @@ def force_expire(
     db.commit()
     if result.rowcount == 0:
         raise AppError(404, "handoff_not_found", "交接码不存在", fields={"/code": "未找到该交接码"})
+
+
+@router.post("/backfill-baselines", status_code=200)
+def backfill_baselines(
+    db: Session = Depends(get_db),
+    x_test_token: str | None = Header(default=None, alias="X-Test-Token"),
+):
+    """验收用：模拟旧数据升级后启动账本，为无账本冻存管补齐“仅代表升级时现状”的基线。"""
+    _ensure_enabled(x_test_token)
+    from .ledger import backfill_baselines as _backfill
+
+    count = _backfill(db)
+    db.commit()
+    return {"backfilled": count}

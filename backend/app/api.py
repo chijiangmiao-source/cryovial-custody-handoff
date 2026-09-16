@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any
 
-from fastapi import APIRouter, Depends, Request, Response
+from fastapi import APIRouter, Depends, Query, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from sqlalchemy import select
@@ -11,6 +12,7 @@ from sqlalchemy.orm import Session, joinedload
 from .database import get_db
 from .errors import AppError, error_body
 from .idempotency import run_command
+from .ledger import build_history
 from .models import ACTIVE_STATUSES, Handoff, Staff, Tube
 from .schemas import (
     AcceptHandoffRequest,
@@ -171,6 +173,36 @@ def get_tube(code: str, db: Session = Depends(get_db)) -> dict[str, Any]:
             "active_handoff": serialize_handoff(db, active, now) if active else None,
         }
     }
+
+
+@router.get("/tubes/{code}/history")
+def get_tube_history(
+    code: str,
+    at: str | None = Query(default=None, description="历史时刻（ISO 8601），缺省为数据库当前时刻"),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """只读：按数据库生效时间投影某管在指定时刻的保管人与保管变更时间轴。"""
+    code = code.strip().upper()
+    point = None
+    if at:
+        try:
+            point = datetime.fromisoformat(at.strip())
+        except ValueError:
+            raise AppError(
+                422,
+                "validation_error",
+                "请求字段校验失败",
+                fields={"/at": "需为 ISO 8601 日期时间，例如 2026-09-16T22:30:00+08:00"},
+            )
+        if point.tzinfo is None:
+            raise AppError(
+                422,
+                "validation_error",
+                "请求字段校验失败",
+                fields={"/at": "必须带时区偏移，例如 2026-09-16T22:30:00+08:00"},
+            )
+    # 纯只读：即使此刻有到期交接，也不在历史读路径上封闭任何状态
+    return {"history": build_history(db, tube_code=code, at=point)}
 
 
 @router.get("/health")

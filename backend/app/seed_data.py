@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from .ledger import ensure_tube_baseline
 from .models import Staff, Tube
 
 # 夜班演示/验收用初始数据
@@ -28,7 +29,14 @@ def seed_data_if_needed(db: Session) -> None:
             db.flush()
         staff_by_code[code] = staff
 
+    # 上线时刻：新冻存管的基线只代表这一时刻的现状（更早无历史证据）
+    now = db.scalar(select(func.statement_timestamp()))
     for tube_code, custodian_code in SEED_TUBES:
-        if db.scalar(select(Tube).where(Tube.code == tube_code)) is None:
-            db.add(Tube(code=tube_code, custodian_id=staff_by_code[custodian_code].id))
+        tube = db.scalar(select(Tube).where(Tube.code == tube_code))
+        if tube is None:
+            tube = Tube(code=tube_code, custodian_id=staff_by_code[custodian_code].id)
+            db.add(tube)
+            db.flush()
+        # 幂等：升级场景下旧冻存管尚无账本时，补一条仅代表上线/升级时现状的基线
+        ensure_tube_baseline(db, tube, now)
     db.commit()

@@ -30,7 +30,10 @@ def _schema():
 def _clean_tables():
     with engine.begin() as conn:
         conn.execute(
-            text("TRUNCATE command_records, handoffs, tubes, staff RESTART IDENTITY CASCADE")
+            text(
+                "TRUNCATE command_records, custody_events, handoffs, tubes, staff "
+                "RESTART IDENTITY CASCADE"
+            )
         )
     seed()
     yield

@@ -26,6 +26,33 @@ export interface TubeInfo {
   active_handoff: Handoff | null;
 }
 
+export interface CustodyEventInfo {
+  seq: number;
+  kind: "baseline" | "transfer";
+  effective_at: string;
+  custodian: Staff;
+  from_staff: Staff | null;
+  to_staff: Staff | null;
+  handoff_code: string | null;
+  active_at_point: boolean;
+}
+
+export interface TubeHistory {
+  tube_code: string;
+  queried_at: string;
+  point_in_time: string;
+  // 上线基线（可追溯起点）；早于该时刻 evidence_available=false
+  traceable_since: string;
+  // false 表示查询时刻早于可追溯起点：没有任何历史证据，不猜测保管人
+  evidence_available: boolean;
+  custodian: Staff | null;
+  event_seq: number | null;
+  handoff_code: string | null;
+  previous_change: CustodyEventInfo | null;
+  next_change: CustodyEventInfo | null;
+  timeline: CustodyEventInfo[];
+}
+
 export interface FieldErrors {
   [pointer: string]: string;
 }
