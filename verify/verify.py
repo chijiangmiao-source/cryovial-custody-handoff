@@ -27,6 +27,8 @@ import psycopg
 
 BACKEND = os.environ.get("BACKEND_URL", "http://backend:8000").rstrip("/")
 WEB = os.environ.get("WEB_URL", "http://web").rstrip("/")
+# 公开入口（nginx → 安全后端）；用于断言页面访客无法触达验收/重置接口
+PUBLIC_API = os.environ.get("PUBLIC_API_URL", WEB).rstrip("/")
 DATABASE_URL = os.environ.get("VERIFY_DATABASE_URL", "")
 # 验收钩子令牌：后端开启 SAMPLE_ENABLE_TEST_RESET 时必须提供，调用 /api/test/* 需带头
 TEST_RESET_TOKEN = os.environ.get("TEST_RESET_TOKEN", "")
@@ -260,7 +262,7 @@ def main() -> int:
 
         # ---------------------------------------------------------------
         print(f"{INFO} 场景 8：验收钩子默认关闭且需令牌（防裸奔）")
-        # 当前运行栈以正确令牌开启了钩子：无令牌/错令牌必须被拒
+        # 演练后端（backend-verify，令牌开启）：无令牌/错令牌必须被拒 401
         no_token = client.post(f"{BACKEND}/api/test/reset", timeout=30)
         check("无令牌调用重置被拒（401；默认关闭时为 404）",
               no_token.status_code in (401, 404), f"HTTP {no_token.status_code}")
@@ -269,13 +271,25 @@ def main() -> int:
         )
         check("错误令牌调用重置被拒（401；默认关闭时为 404）",
               wrong_token.status_code in (401, 404), f"HTTP {wrong_token.status_code}")
-        # 安全检查不得改动数据：最后用正确令牌重置并复核管状态仍可被验收正常建立
+        # 公开入口（页面访客经 nginx 打到安全后端）：钩子根本未挂载，一律 404，
+        # 即使带上验收令牌也无法通过公开入口清空数据
+        public_reset = client.post(f"{PUBLIC_API}/api/test/reset", timeout=30)
+        check("公开入口不暴露重置接口（404）",
+              public_reset.status_code == 404, f"HTTP {public_reset.status_code}")
+        public_reset_token = client.post(
+            f"{PUBLIC_API}/api/test/reset",
+            headers={"X-Test-Token": TEST_RESET_TOKEN} if TEST_RESET_TOKEN else {},
+            timeout=30,
+        )
+        check("公开入口即使持验收令牌仍不可清空（404）",
+              public_reset_token.status_code == 404, f"HTTP {public_reset_token.status_code}")
+        # 持正确令牌经验收后端可正常调用（204）
         guarded = client.post(
             f"{BACKEND}/api/test/handoffs/{new_code}/expire",
             headers={"X-Test-Token": TEST_RESET_TOKEN} if TEST_RESET_TOKEN else {},
             timeout=30,
         )
-        check("持正确令牌的钩子调用成功（204）", guarded.status_code == 204, f"HTTP {guarded.status_code}")
+        check("持正确令牌经验收后端调用成功（204）", guarded.status_code == 204, f"HTTP {guarded.status_code}")
 
     # ---------------------------------------------------------------
     print(f"{INFO} 数据库最终一致性断言")

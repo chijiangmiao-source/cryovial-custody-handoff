@@ -1,9 +1,16 @@
-# 冷冻样本库夜班交接 —— 默认（生产形态）本地编排
-# 前端宿主机端口由 WEB_PORT 覆盖：WEB_PORT=8080 docker compose up --build
+# 冷冻样本库夜班交接 —— 默认本地编排
 #
-# 注意：默认配置【不挂载】任何验收/重置接口（SAMPLE_ENABLE_TEST_RESET 默认 false），
-# 任何能访问页面的人都无法清空交接与保管记录。需要跑一次性验收时，
-# 额外叠加 docker-compose.verify.yml（见 README）。
+# 日常启动（安全形态，验收/重置接口不挂载）：
+#   WEB_PORT=8080 docker compose up --build
+#
+# 一次性验收（默认配置即可直接完成，验收服务在 verify profile 中，run 会自动激活）：
+#   docker compose up -d --build db web
+#   docker compose run --rm verify
+#
+# 安全隔离：
+#   - backend：面向页面的公开后端，SAMPLE_ENABLE_TEST_RESET=false，/api/test/* 为 404；
+#   - backend-verify：仅 compose 内网可达、不发布端口、需 X-Test-Token，供 verify 使用；
+#   - 页面访客经 nginx 只能访问 backend，无法触达 backend-verify，故无法清空数据。
 services:
   db:
     image: postgres:17-alpine
@@ -19,13 +26,26 @@ services:
       timeout: 3s
       retries: 30
 
+  # 面向页面的公开后端：默认不挂载任何验收/重置接口
   backend:
     build: ./backend
     environment:
       SAMPLE_DATABASE_URL: postgresql+psycopg://sample:sample@db:5432/sample_db
       SAMPLE_HANDOFF_TTL_SECONDS: "600"
-      # 验收钩子默认关闭；请不要在面向真实数据的环境开启
       SAMPLE_ENABLE_TEST_RESET: "false"
+    depends_on:
+      db:
+        condition: service_healthy
+
+  # 验收专用后端：仅内网可达（不发布宿主机端口），开启钩子并强制令牌
+  backend-verify:
+    profiles: ["verify"]
+    build: ./backend
+    environment:
+      SAMPLE_DATABASE_URL: postgresql+psycopg://sample:sample@db:5432/sample_db
+      SAMPLE_HANDOFF_TTL_SECONDS: "600"
+      SAMPLE_ENABLE_TEST_RESET: "true"
+      SAMPLE_TEST_RESET_TOKEN: ${TEST_RESET_TOKEN:-verify-local-token}
     depends_on:
       db:
         condition: service_healthy
@@ -37,6 +57,27 @@ services:
       - "${WEB_PORT:-8080}:80"
     depends_on:
       - backend
+
+  # 一次性验收服务：docker compose run --rm verify；跑完即退出，退出码即结论
+  verify:
+    profiles: ["verify"]
+    build: ./verify
+    environment:
+      # 演练流量走内网的验收后端，页面静态资源走公开 web
+      BACKEND_URL: http://backend-verify:8000
+      WEB_URL: http://web
+      # 公开入口（nginx → 安全后端），用于断言页面对外不暴露重置接口
+      PUBLIC_API_URL: http://web
+      VERIFY_DATABASE_URL: postgresql://sample:sample@db:5432/sample_db
+      TEST_RESET_TOKEN: ${TEST_RESET_TOKEN:-verify-local-token}
+    depends_on:
+      db:
+        condition: service_healthy
+      backend-verify:
+        condition: service_started
+      web:
+        condition: service_started
+    restart: "no"
 
 volumes:
   pgdata:

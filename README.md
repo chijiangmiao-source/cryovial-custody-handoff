@@ -51,29 +51,37 @@ WEB_PORT=9000 docker compose up --build
 
 内置演示数据：员工 `S001 张敏`（转出/保管人）、`S002 李强`、`S003 王芳`；冻存管 `T-1001`、`T-1002`，初始保管人均为 `S001`。
 
-### 一次性验收服务
+### 一次性验收服务（默认配置即可直接完成）
 
-**默认 `docker compose up` 不开启任何验收/重置接口**（`SAMPLE_ENABLE_TEST_RESET=false`），任何能访问页面的人都无法清空交接与保管记录。
+默认 `docker compose up` 只对外提供**安全形态**：公开后端 `backend` 不挂载任何验收/重置接口
+（`SAMPLE_ENABLE_TEST_RESET=false`，`/api/test/*` 一律 404），任何能访问页面的人都无法清空交接与保管记录。
 
-验收时叠加 `docker-compose.verify.yml`：它会为后端开启验收钩子并要求 `X-Test-Token` 令牌，
-同时提供**跑完即退出**的 `verify` 服务，真实制造：重复扫码（同键并发双发）、确认丢响应（同键并发双发）、
-两次创建竞争、同键异参冲突、完成后非接收员扫码、旧交接重放、到期边界，并直连数据库核对
-“每管活动交接 ≤ 1、保管人唯一、失败交接不夺管”。
+验收能力内置在同一 `docker-compose.yml` 的 `verify` profile 中，与对外服务**物理隔离**：
+
+- `backend-verify`：只在 compose 内网可达、**不发布宿主机端口**、开启钩子并强制 `X-Test-Token`；
+- `verify`：跑完即退出的一次性服务，演练流量打内网 `backend-verify`，并额外断言**经 nginx 的公开入口**
+  即使携带令牌也无法触达重置接口。
+
+无需任何额外文件，一条命令即可完成验收（`run` 会自动激活 `verify` profile 并拉起 db/web/两个后端）：
 
 ```bash
-# 可通过 TEST_RESET_TOKEN 指定令牌；两端必须一致
-export TEST_RESET_TOKEN=$(openssl rand -hex 16)
-
-docker compose -f docker-compose.yml -f docker-compose.verify.yml \
-  up -d --build db backend web
-docker compose -f docker-compose.yml -f docker-compose.verify.yml run --rm verify
-# 退出码 0 即通过；验收结束后停掉带钩子的后端，用默认配置重启即可恢复安全形态
-docker compose -f docker-compose.yml -f docker-compose.verify.yml down
+docker compose run --rm verify        # 真实制造重复扫码、确认丢响应、两次创建竞争、
+                                      # 同键异参、完成后非接收员扫码、到期边界等；退出码 0 即通过
+docker compose down                   # 验收后清理
 ```
 
+可通过 `TEST_RESET_TOKEN` 指定令牌（验收后端与 verify 两端必须一致，默认仅本地用的 `verify-local-token`）：
+
+```bash
+TEST_RESET_TOKEN=$(openssl rand -hex 16) docker compose run --rm verify
+```
+
+> 安全模型：页面访客 → nginx → 公开 `backend`（钩子未挂载，404）；`backend-verify` 不暴露端口、
+> 仅内网 + 令牌可达。**面向真实数据的环境请保持默认 `up`，不要运行 verify profile，也不要发布 backend-verify 端口。**
+>
 > 验收钩子 `/api/test/reset`、`/api/test/handoffs/{code}/expire` 仅在
 > `SAMPLE_ENABLE_TEST_RESET=true` 且配置了 `SAMPLE_TEST_RESET_TOKEN` 时挂载；
-> 未开启时返回 404（路由不存在），开启但令牌缺失/错误时返回 401。**面向真实数据的环境必须保持默认关闭。**
+> 未开启时返回 404（路由不存在），开启但令牌缺失/错误时返回 401。
 
 ## 故障复现（手动）
 
