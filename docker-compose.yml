@@ -1,0 +1,55 @@
+# 冷冻样本库夜班交接 —— 本地一键编排
+# 前端宿主机端口由 WEB_PORT 覆盖：WEB_PORT=8080 docker compose up --build
+services:
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: sample_db
+      POSTGRES_USER: sample
+      POSTGRES_PASSWORD: sample
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sample -d sample_db"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+
+  backend:
+    build: ./backend
+    environment:
+      SAMPLE_DATABASE_URL: postgresql+psycopg://sample:sample@db:5432/sample_db
+      # 验收钩子（重置数据/模拟到期）。生产部署请置为 false 或删除
+      SAMPLE_ENABLE_TEST_RESET: "true"
+      SAMPLE_HANDOFF_TTL_SECONDS: "600"
+    depends_on:
+      db:
+        condition: service_healthy
+
+  web:
+    build: ./frontend
+    ports:
+      # 宿主机端口可用 WEB_PORT 覆盖，默认 8080
+      - "${WEB_PORT:-8080}:80"
+    depends_on:
+      - backend
+
+  # 一次性验收服务：docker compose run --rm verify
+  # 制造重复扫码、确认丢响应、两次创建竞争与到期边界，并直连数据库核对唯一保管人
+  verify:
+    build: ./verify
+    environment:
+      BACKEND_URL: http://backend:8000
+      WEB_URL: http://web
+      VERIFY_DATABASE_URL: postgresql://sample:sample@db:5432/sample_db
+    depends_on:
+      db:
+        condition: service_healthy
+      backend:
+        condition: service_healthy
+      web:
+        condition: service_started
+    restart: "no"
+
+volumes:
+  pgdata:
